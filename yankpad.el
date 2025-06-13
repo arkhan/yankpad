@@ -320,8 +320,8 @@ Prompts for CATEGORY if it isn't provided."
 
 (defun yankpad-reload ()
   "Clear the snippet cache.
-The next try to `yankpad-insert` will reload `yankpad-file`.
-Useful to run after editing the `yankpad-file`.
+The next try to `yankpad-insert` will reload `yankpad-file'.
+Useful to run after editing the `yankpad-file'.
 
 If `yankpad-descriptive-list-treatment' is 'abbrev,
 `yankpad-category' will be scanned for abbrevs."
@@ -672,6 +672,50 @@ removed from the snippet text."
                           (replace-regexp-in-string org-property-drawer-re "" text))))
             (list (list heading tags src-blocks text properties))))))))
 
+;; FIXED: Use safer method to get snippets that handles cache issues
+(defun yankpad--snippets-safe (category-name)
+  "Get snippets from CATEGORY-NAME using a safe method that avoids cache issues."
+  (condition-case err
+      (yankpad--snippets category-name)
+    (error
+     (message "Yankpad: Cache error, using fallback method")
+     (yankpad--snippets-fallback category-name))))
+
+(defun yankpad--snippets-fallback (category-name)
+  "Fallback method to get snippets without using org-map-entries."
+  (let* ((data (yankpad--file-elements))
+         (category-headline (org-element-map data 'headline
+                             (lambda (h)
+                               (when (and (equal (org-element-property :level h)
+                                                yankpad-category-heading-level)
+                                         (string-equal (org-element-property :raw-value h) category-name))
+                                 h))
+                             nil t)))
+    (when category-headline
+      (let ((snippets '())
+            (current-element category-headline))
+        ;; Get direct children of the category
+        (org-element-map category-headline 'headline
+          (lambda (h)
+            (when (equal (org-element-property :level h)
+                        (1+ yankpad-category-heading-level))
+              (let* ((heading (org-element-property :raw-value h))
+                     (tags (org-element-property :tags h))
+                     (begin (org-element-property :contents-begin h))
+                     (end (org-element-property :contents-end h))
+                     (content (if (and begin end)
+                                 (buffer-substring-no-properties begin end)
+                               "")))
+                (push (list heading tags nil content nil) snippets)))))
+
+        ;; Add descriptive list snippets if needed
+        (when (eq yankpad-descriptive-list-treatment 'snippet)
+          (let ((descriptions (yankpad-category-descriptions category-name)))
+            (dolist (d descriptions)
+              (push (list (concat (car d) yankpad-expand-separator) nil nil (cdr d) nil) snippets))))
+
+        (nreverse snippets)))))
+
 (defun yankpad--snippets (category-name)
   "Get an alist of the snippets in CATEGORY-NAME.
 Each snippet is a list (NAME TAGS SRC-BLOCKS TEXT)."
@@ -684,12 +728,17 @@ Each snippet is a list (NAME TAGS SRC-BLOCKS TEXT)."
              (mapcar (lambda (d)
                        (list (concat (car d) yankpad-expand-separator) nil nil (cdr d)))
                      (yankpad-category-descriptions category-name)))
-           (org-with-point-at (yankpad-category-marker category-name)
-             (cl-reduce #'append
-                        (org-map-entries #'yankpad-snippets-at-point
-                                         (format "+LEVEL=%s" (1+ yankpad-category-heading-level))
-                                         'tree))))))
-    (append snippets (cl-reduce #'append (mapcar #'yankpad--snippets include)))))
+           ;; FIXED: Use condition-case to handle cache errors gracefully
+           (condition-case err
+               (org-with-point-at (yankpad-category-marker category-name)
+                 (cl-reduce #'append
+                            (org-map-entries #'yankpad-snippets-at-point
+                                             (format "+LEVEL=%s" (1+ yankpad-category-heading-level))
+                                             'tree)))
+             (error
+              (message "Yankpad: Error getting snippets for %s: %s" category-name (error-message-string err))
+              nil)))))
+    (append snippets (cl-reduce #'append (mapcar #'yankpad--snippets-safe include)))))
 
 ;;;###autoload
 (defun yankpad-map ()
@@ -777,29 +826,33 @@ If successful, make `yankpad-category' buffer-local."
 Descriptions are fetched from descriptive lists in `org-mode',
 under the same heading level as CATEGORY.
 Each element is (KEY . DESCRIPTION), both strings."
-  (org-with-point-at (yankpad-category-marker category)
-    (org-narrow-to-subtree)
-    (apply
-     #'append
-     (org-element-map (org-element-parse-buffer) 'plain-list
-       (lambda (dl)
-         (let ((parent (funcall (if (version< (org-version) "8.3")
-                                    #'org-export-get-genealogy
-                                  #'org-element-lineage)
-                                dl '(headline))))
-           (when (and (equal (org-element-property :type dl) 'descriptive)
-                      (or (equal (org-element-property :level parent)
-                                 yankpad-category-heading-level)
-                          (save-excursion
-                            (goto-char (org-element-property :begin parent))
-                            (org-goto-first-child))
-                          (member "snippetlist" (org-element-property :tags parent))))
-             (org-element-map dl 'item
-               (lambda (i)
-                 (cons (org-no-properties (car (org-element-property :tag i)))
-                       (string-trim (buffer-substring-no-properties
-                                     (org-element-property :contents-begin i)
-                                     (org-element-property :contents-end i)))))))))))))
+  (condition-case err
+      (org-with-point-at (yankpad-category-marker category)
+        (org-narrow-to-subtree)
+        (apply
+         #'append
+         (org-element-map (org-element-parse-buffer) 'plain-list
+           (lambda (dl)
+             (let ((parent (funcall (if (version< (org-version) "8.3")
+                                        #'org-export-get-genealogy
+                                      #'org-element-lineage)
+                                    dl '(headline))))
+               (when (and (equal (org-element-property :type dl) 'descriptive)
+                          (or (equal (org-element-property :level parent)
+                                     yankpad-category-heading-level)
+                              (save-excursion
+                                (goto-char (org-element-property :begin parent))
+                                (org-goto-first-child))
+                              (member "snippetlist" (org-element-property :tags parent))))
+                 (org-element-map dl 'item
+                   (lambda (i)
+                     (cons (org-no-properties (car (org-element-property :tag i)))
+                           (string-trim (buffer-substring-no-properties
+                                         (org-element-property :contents-begin i)
+                                         (org-element-property :contents-end i))))))))))))
+    (error
+     (message "Yankpad: Error getting descriptions for %s: %s" category (error-message-string err))
+     nil)))
 
 (defun yankpad--get-completion-candidates (prefix snippets categories)
   "Return a list of completion candidates based on PREFIX and separator."
@@ -846,40 +899,45 @@ Each element is (KEY . DESCRIPTION), both strings."
 (defun yankpad-capf ()
   "Completion-at-point function for Yankpad with advanced support."
   (interactive)
-  (when (and (featurep 'yankpad) yankpad-file)
-    (let* ((bounds (or (bounds-of-thing-at-point 'word) (cons (point) (point))))
-           (start (car bounds))
-           (end (cdr bounds))
-           (prefix (buffer-substring-no-properties start end))
-           (snippets (yankpad-active-snippets))
-           (categories (yankpad--categories))
-           (completions (yankpad--get-completion-candidates prefix snippets categories)))
-      (when (and completions
-                 (or (> (length prefix) 0)
-                     (> (length completions) 0)))
-        (list start end completions
-              :annotation-function (lambda (candidate)
-                                     (get-text-property 0 'annotation candidate))
-              :company-kind (lambda (_) 'snippet)
-              :company-doc-buffer #'yankpad--doc-buffer
-              :exit-function (lambda (candidate status)
-                               (when (string= status "finished")
-                                 (let* ((current-point (point))
-                                        (region-start (- current-point (length candidate))))
-                                   (delete-region region-start current-point)
-                                   (if (member candidate categories)
-                                       (progn
-                                         (insert candidate)
-                                         (yankpad-set-category)
-                                         (message "Category changed to %s" candidate))
-                                     (let* ((full-snippet-name
-                                             (cl-find-if (lambda (snippet)
-                                                          (string-prefix-p candidate (car snippet)))
-                                                        snippets))
-                                            (yankpad-snippet (assoc (car full-snippet-name) snippets)))
-                                       (when yankpad-snippet
-                                         (yankpad--run-snippet yankpad-snippet))))))
-              :exclusive 'yes))))))
+  (when (and (featurep 'yankpad) yankpad-file (file-exists-p yankpad-file))
+    ;; FIXED: Add condition-case to handle cache errors gracefully
+    (condition-case err
+        (let* ((bounds (or (bounds-of-thing-at-point 'word) (cons (point) (point))))
+               (start (car bounds))
+               (end (cdr bounds))
+               (prefix (buffer-substring-no-properties start end))
+               (snippets (yankpad-active-snippets))
+               (categories (yankpad--categories))
+               (completions (yankpad--get-completion-candidates prefix snippets categories)))
+          (when (and completions
+                     (or (> (length prefix) 0)
+                         (> (length completions) 0)))
+            (list start end completions
+                  :annotation-function (lambda (candidate)
+                                         (get-text-property 0 'annotation candidate))
+                  :company-kind (lambda (_) 'snippet)
+                  :company-doc-buffer #'yankpad--doc-buffer
+                  :exit-function (lambda (candidate status)
+                                   (when (string= status "finished")
+                                     (let* ((current-point (point))
+                                            (region-start (- current-point (length candidate))))
+                                       (delete-region region-start current-point)
+                                       (if (member candidate categories)
+                                           (progn
+                                             (insert candidate)
+                                             (yankpad-set-category)
+                                             (message "Category changed to %s" candidate))
+                                         (let* ((full-snippet-name
+                                                 (cl-find-if (lambda (snippet)
+                                                              (string-prefix-p candidate (car snippet)))
+                                                            snippets))
+                                                (yankpad-snippet (assoc (car full-snippet-name) snippets)))
+                                           (when yankpad-snippet
+                                             (yankpad--run-snippet yankpad-snippet)))))))
+                  :exclusive 'yes)))
+      (error
+       (message "Yankpad completion error: %s" (error-message-string err))
+       nil))))
 
 (provide 'yankpad)
 ;;; yankpad.el ends here
