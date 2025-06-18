@@ -327,6 +327,7 @@ If `yankpad-descriptive-list-treatment' is 'abbrev,
 `yankpad-category' will be scanned for abbrevs."
   (interactive)
   (setq yankpad--active-snippets nil)
+  (setq yankpad--cache nil)
   (when (and (eq yankpad-descriptive-list-treatment 'abbrev)
              yankpad-category)
     (yankpad-load-abbrevs)))
@@ -541,8 +542,7 @@ This function can be added to `hippie-expand-try-functions-list'."
                    (throw 'loop snippet)))
 
              ;; Otherwise look for expand keyword
-             (when (string-prefix-p snippet-prefix
-                                    (car (split-string (car snippet) " ")))
+             (when (member symbol (butlast (split-string (car snippet) yankpad-expand-separator)))
                (delete-region (car bounds) (cdr bounds))
                (yankpad--run-snippet snippet)
                (throw 'loop snippet))
@@ -672,73 +672,30 @@ removed from the snippet text."
                           (replace-regexp-in-string org-property-drawer-re "" text))))
             (list (list heading tags src-blocks text properties))))))))
 
-;; FIXED: Use safer method to get snippets that handles cache issues
-(defun yankpad--snippets-safe (category-name)
-  "Get snippets from CATEGORY-NAME using a safe method that avoids cache issues."
-  (condition-case err
-      (yankpad--snippets category-name)
-    (error
-     (message "Yankpad: Cache error, using fallback method")
-     (yankpad--snippets-fallback category-name))))
-
-(defun yankpad--snippets-fallback (category-name)
-  "Fallback method to get snippets without using org-map-entries."
-  (let* ((data (yankpad--file-elements))
-         (category-headline (org-element-map data 'headline
-                             (lambda (h)
-                               (when (and (equal (org-element-property :level h)
-                                                yankpad-category-heading-level)
-                                         (string-equal (org-element-property :raw-value h) category-name))
-                                 h))
-                             nil t)))
-    (when category-headline
-      (let ((snippets '())
-            (current-element category-headline))
-        ;; Get direct children of the category
-        (org-element-map category-headline 'headline
-          (lambda (h)
-            (when (equal (org-element-property :level h)
-                        (1+ yankpad-category-heading-level))
-              (let* ((heading (org-element-property :raw-value h))
-                     (tags (org-element-property :tags h))
-                     (begin (org-element-property :contents-begin h))
-                     (end (org-element-property :contents-end h))
-                     (content (if (and begin end)
-                                 (buffer-substring-no-properties begin end)
-                               "")))
-                (push (list heading tags nil content nil) snippets)))))
-
-        ;; Add descriptive list snippets if needed
-        (when (eq yankpad-descriptive-list-treatment 'snippet)
-          (let ((descriptions (yankpad-category-descriptions category-name)))
-            (dolist (d descriptions)
-              (push (list (concat (car d) yankpad-expand-separator) nil nil (cdr d) nil) snippets))))
-
-        (nreverse snippets)))))
+(defvar yankpad--cache nil "An alist of category-name . snippets.")
 
 (defun yankpad--snippets (category-name)
   "Get an alist of the snippets in CATEGORY-NAME.
-Each snippet is a list (NAME TAGS SRC-BLOCKS TEXT)."
-  (let* ((propertystring (yankpad--category-include-property category-name))
-         (include (when propertystring
-                    (split-string propertystring "|")))
-         (snippets
-          (append
-           (when (eq yankpad-descriptive-list-treatment 'snippet)
-             (mapcar (lambda (d)
-                       (list (concat (car d) yankpad-expand-separator) nil nil (cdr d)))
-                     (yankpad-category-descriptions category-name)))
-           ;; FIXED: Use condition-case to handle cache errors gracefully
-           (condition-case err
+Each snippet is a list (NAME TAGS SRC-BLOCKS TEXT).
+Tries to get a cached version from `yankpad--cache' if there is one."
+  (or (alist-get category-name yankpad--cache)
+      (let* ((propertystring (yankpad--category-include-property category-name))
+             (include (when propertystring
+                        (split-string propertystring "|")))
+             (snippets
+              (append
+               (when (eq yankpad-descriptive-list-treatment 'snippet)
+                 (mapcar (lambda (d)
+                           (list (concat (car d) yankpad-expand-separator) nil nil (cdr d)))
+                         (yankpad-category-descriptions category-name)))
                (org-with-point-at (yankpad-category-marker category-name)
                  (cl-reduce #'append
                             (org-map-entries #'yankpad-snippets-at-point
                                              (format "+LEVEL=%s" (1+ yankpad-category-heading-level))
-                                             'tree)))
-             (error
-              (message "Yankpad: Error getting snippets for %s: %s" category-name (error-message-string err))
-              nil)))))
-    (append snippets (cl-reduce #'append (mapcar #'yankpad--snippets-safe include)))))
+                                             'tree)))))
+             (all-snippets (append snippets (cl-reduce #'append (mapcar #'yankpad--snippets include)))))
+        (add-to-list 'yankpad--cache (cons category-name all-snippets))
+        all-snippets)))
 
 ;;;###autoload
 (defun yankpad-map ()
@@ -756,9 +713,9 @@ Each snippet is a list (NAME TAGS SRC-BLOCKS TEXT)."
                       (key (substring-no-properties last-tag)))
                   (push (cons key (format "[%s] %s " key heading)) map-help)
                   (define-key yankpad-keymap (kbd key)
-                    `(lambda ()
-                       (interactive)
-                       (yankpad--run-snippet ',snippet)))))))
+                              `(lambda ()
+                                 (interactive)
+                                 (yankpad--run-snippet ',snippet)))))))
           (yankpad-active-snippets))
     (let ((message-log-max nil))
       (message "yankpad: %s"
