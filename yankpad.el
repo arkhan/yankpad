@@ -234,6 +234,56 @@ snippets."
   "Get the snippets in the current category."
   (or yankpad--active-snippets (yankpad-set-active-snippets)))
 
+;; Tree-Sitter mode support functions
+(defun yankpad--tree-sitter-mode-p (mode)
+  "Return non-nil if MODE is a Tree-Sitter mode."
+  (and (symbolp mode)
+       (string-suffix-p "-ts-mode" (symbol-name mode))))
+
+(defun yankpad--get-non-ts-mode (ts-mode)
+  "Get the corresponding non-Tree-Sitter mode for TS-MODE.
+For example, `python-ts-mode' returns `python-mode'."
+  (when (yankpad--tree-sitter-mode-p ts-mode)
+    (let ((mode-name (symbol-name ts-mode)))
+      (intern (replace-regexp-in-string "-ts-mode$" "-mode" mode-name)))))
+
+(defun yankpad--get-ts-mode (non-ts-mode)
+  "Get the corresponding Tree-Sitter mode for NON-TS-MODE.
+For example, `python-mode' returns `python-ts-mode'."
+  (when (and (symbolp non-ts-mode)
+             (string-suffix-p "-mode" (symbol-name non-ts-mode))
+             (not (yankpad--tree-sitter-mode-p non-ts-mode)))
+    (let ((mode-name (symbol-name non-ts-mode)))
+      (intern (replace-regexp-in-string "-mode$" "-ts-mode" mode-name)))))
+
+(defun yankpad--get-related-mode-categories (mode categories)
+  "Get category names for MODE and its Tree-Sitter/non-Tree-Sitter counterpart.
+Returns a list of category names that exist in CATEGORIES."
+  (let ((mode-name (symbol-name mode))
+        (related-categories '()))
+    ;; Add the current mode if it exists in categories
+    (when (member mode-name categories)
+      (push mode-name related-categories))
+
+    ;; If this is a Tree-Sitter mode, check for the non-TS counterpart
+    (when (yankpad--tree-sitter-mode-p mode)
+      (let ((non-ts-mode (yankpad--get-non-ts-mode mode)))
+        (when non-ts-mode
+          (let ((non-ts-name (symbol-name non-ts-mode)))
+            (when (member non-ts-name categories)
+              (push non-ts-name related-categories))))))
+
+    ;; If this is a non-TS mode, check for the TS counterpart
+    (when (and (not (yankpad--tree-sitter-mode-p mode))
+               (string-suffix-p "-mode" mode-name))
+      (let ((ts-mode (yankpad--get-ts-mode mode)))
+        (when ts-mode
+          (let ((ts-name (symbol-name ts-mode)))
+            (when (member ts-name categories)
+              (push ts-name related-categories))))))
+
+    related-categories))
+
 ;;;###autoload
 (defun yankpad-set-category ()
   "Change the yankpad category."
@@ -253,8 +303,16 @@ snippets."
   (run-hooks 'yankpad-switched-category-hook))
 
 (defsubst yankpad-major-mode-category ()
-  "Return a category name based on the major mode."
-  (symbol-name major-mode))
+  "Return a category name based on the major mode.
+For Tree-Sitter modes, prefer the non-TS mode name if it exists as a category."
+  (let ((categories (yankpad--categories))
+        (current-mode major-mode))
+    (if (yankpad--tree-sitter-mode-p current-mode)
+        (let ((non-ts-mode (yankpad--get-non-ts-mode current-mode)))
+          (if (and non-ts-mode (member (symbol-name non-ts-mode) categories))
+              (symbol-name non-ts-mode)
+            (symbol-name current-mode)))
+      (symbol-name current-mode))))
 
 (defsubst yankpad-projectile-category ()
   "Return a category name based on the projectile project name."
@@ -305,9 +363,10 @@ Prompts for CATEGORY if it isn't provided."
   (mapc #'yankpad--add-abbrevs-from-category (yankpad--global-categories))
   (when (local-variable-p 'yankpad-category)
     (let ((categories (yankpad--categories)))
-      (when-let* ((major-mode-category (car (member (symbol-name major-mode)
-                                                    categories))))
-        (yankpad--add-abbrevs-from-category major-mode-category))
+      ;; Use the enhanced function to get related mode categories
+      (dolist (category-name (yankpad--get-related-mode-categories major-mode categories))
+        (yankpad--add-abbrevs-from-category category-name))
+
       (when (require 'projectile nil t)
         (when-let* ((projectile-category (car (member (projectile-project-name)
                                                       categories))))
@@ -738,11 +797,13 @@ Tries to get a cached version from `yankpad--cache' if there is one."
   "Try to change `yankpad-category' to match the buffer's major mode.
 If successful, make `yankpad-category' buffer-local.
 If no major mode category is found, it uses `yankpad-default-category',
-if that is defined in the `yankpad-file'."
+if that is defined in the `yankpad-file'.
+
+For Tree-Sitter modes, also checks for the corresponding non-TS mode category."
   (when (file-exists-p yankpad-file)
     (let* ((categories (yankpad--categories))
-           (category (or (car (member (symbol-name major-mode)
-                                      categories))
+           (related-categories (yankpad--get-related-mode-categories major-mode categories))
+           (category (or (car related-categories)
                          (car (member yankpad-default-category categories)))))
       (when category (yankpad-set-local-category category)))))
 
