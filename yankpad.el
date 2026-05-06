@@ -346,8 +346,10 @@ Prompts for CATEGORY if it isn't provided."
   (interactive (list (completing-read "Category: " (yankpad--categories))))
   (unless (equal category yankpad-category)
     (unless yankpad--active-snippets (yankpad-set-active-snippets))
-    (dolist (x (yankpad--snippets category))
-      (add-to-list 'yankpad--active-snippets x t))))
+    (setq yankpad--active-snippets
+          (cl-union yankpad--active-snippets
+                    (yankpad--snippets category)
+                    :test #'equal))))
 
 (defun yankpad--add-abbrevs-from-category (category)
   "`define-abbrev' in `local-abbrev-table' for each descriptive list item in CATEGORY."
@@ -387,6 +389,7 @@ If `yankpad-descriptive-list-treatment' is 'abbrev,
   (interactive)
   (setq yankpad--active-snippets nil)
   (setq yankpad--cache nil)
+  (setq yankpad--file-elements-cache nil)
   (when (and (eq yankpad-descriptive-list-treatment 'abbrev)
              yankpad-category)
     (yankpad-load-abbrevs)))
@@ -637,14 +640,6 @@ This function can be added to `hippie-expand-try-functions-list'."
       (org-show-entry)
       (org-show-subtree))))
 
-(defun yankpad--file-elements ()
-  "Run `org-element-parse-buffer' on the `yankpad-file'."
-  (with-temp-buffer
-    (delay-mode-hooks
-      (org-mode)
-      (insert-file-contents yankpad-file)
-      (org-element-parse-buffer))))
-
 (defun yankpad--categories ()
   "Get the yankpad categories as a list."
   (let ((data (yankpad--file-elements)))
@@ -733,11 +728,24 @@ removed from the snippet text."
 
 (defvar yankpad--cache nil "An alist of category-name . snippets.")
 
+(defvar yankpad--file-elements-cache nil
+  "Cached result of parsing `yankpad-file'.  Invalidated by `yankpad-reload'.")
+
+(defun yankpad--file-elements ()
+  "Return the org-element tree of `yankpad-file', using a cache."
+  (or yankpad--file-elements-cache
+      (setq yankpad--file-elements-cache
+            (with-temp-buffer
+              (delay-mode-hooks
+                (org-mode)
+                (insert-file-contents yankpad-file)
+                (org-element-parse-buffer))))))
+
 (defun yankpad--snippets (category-name)
   "Get an alist of the snippets in CATEGORY-NAME.
 Each snippet is a list (NAME TAGS SRC-BLOCKS TEXT).
 Tries to get a cached version from `yankpad--cache' if there is one."
-  (or (alist-get category-name yankpad--cache)
+  (or (alist-get category-name yankpad--cache nil nil #'equal)
       (let* ((propertystring (yankpad--category-include-property category-name))
              (include (when propertystring
                         (split-string propertystring "|")))
@@ -872,89 +880,84 @@ Each element is (KEY . DESCRIPTION), both strings."
      (message "Yankpad: Error getting descriptions for %s: %s" category (error-message-string err))
      nil)))
 
-(defun yankpad--get-completion-candidates (prefix snippets categories)
-  "Return a list of completion candidates based on PREFIX and separator."
-  (let ((candidates '())
-        (sep yankpad-expand-separator))
-    (dolist (cat categories)
-      (when (string-prefix-p prefix cat t)
-        (push cat candidates)))
+(defun yankpad--get-completion-candidates (prefix snippets)
+  "Return completion candidates matching PREFIX from SNIPPETS.
+Each candidate string has an \\='annotation text property with the snippet title."
+  (let ((sep yankpad-expand-separator)
+        candidates)
     (dolist (snippet snippets)
       (let* ((name (car snippet))
-             (name-parts (split-string name sep t))
-             (keyword (car name-parts))
-             (annotation (mapconcat 'identity (cdr name-parts) sep)))
+             (parts (split-string name sep t))
+             (keyword (car parts))
+             (title (mapconcat #'identity (cdr parts) sep)))
         (when (and keyword (string-prefix-p prefix keyword t))
-          (push (propertize keyword 'annotation annotation) candidates))))
+          (push (propertize keyword
+                             'annotation (unless (string-empty-p title)
+                                           (concat " " title)))
+                candidates))))
     (sort (delete-dups candidates) #'string-lessp)))
 
 (defun yankpad--doc-buffer (candidate)
-  "Return a buffer with detailed documentation for the Yankpad CANDIDATE."
-  (let ((snippets (yankpad-active-snippets))
-        (categories (yankpad--categories)))
-    (let* ((full-snippet-name
-            (cl-find-if (lambda (snippet)
-                          (string-prefix-p candidate (car snippet)))
-                        snippets))
-           (snippet (assoc (car full-snippet-name) snippets)))
-      (when snippet
-        (with-current-buffer (get-buffer-create "*Yankpad Doc*")
-          (erase-buffer)
-          (insert (format "Snippet: %s\n\n" (car snippet)))
-          (let ((snippet-text (yankpad-snippet-text snippet)))
-            (when snippet-text
-              (insert "Content:\n")
-              (insert snippet-text)
-              (insert "\n\n")))
-          (when (> (length snippet) 1)
-            (insert "Additional details:\n")
-            (dolist (detail (cdr snippet))
-              (insert (format "- %S\n" detail))))
-          (goto-char (point-min))
-          (current-buffer))))))
+  "Return a buffer with documentation for the Yankpad CANDIDATE."
+  (when-let ((snippet (cl-find-if
+                       (lambda (s)
+                         (let ((kw (car (split-string (car s)
+                                                      yankpad-expand-separator t))))
+                           (equal kw candidate)))
+                       (yankpad-active-snippets))))
+    (with-current-buffer (get-buffer-create "*Yankpad Doc*")
+      (erase-buffer)
+      (insert (format "Snippet: %s\n\n" (car snippet)))
+      (when-let ((text (yankpad-snippet-text snippet)))
+        (insert "Content:\n" text "\n\n"))
+      (when (nth 1 snippet)
+        (insert (format "Tags: %S\n" (nth 1 snippet))))
+      (goto-char (point-min))
+      (current-buffer))))
 
 ;;;###autoload
 (defun yankpad-capf ()
-  "Completion-at-point function for Yankpad with advanced support."
-  (interactive)
-  (when (and (featurep 'yankpad) yankpad-file (file-exists-p yankpad-file))
-    ;; FIXED: Add condition-case to handle cache errors gracefully
+  "Completion-at-point function for Yankpad snippets.
+Add to `completion-at-point-functions' to enable snippet expansion via
+standard completion UI (corfu, vertico, company, etc.)."
+  (when (and yankpad-file (file-exists-p yankpad-file))
     (condition-case err
-        (let* ((bounds (or (bounds-of-thing-at-point 'word) (cons (point) (point))))
+        (let* ((bounds (or (bounds-of-thing-at-point 'word)
+                           (cons (point) (point))))
                (start (car bounds))
-               (end (cdr bounds))
+               (end   (cdr bounds))
                (prefix (buffer-substring-no-properties start end))
                (snippets (yankpad-active-snippets))
-               (categories (yankpad--categories))
-               (completions (yankpad--get-completion-candidates prefix snippets categories)))
-          (when (and completions
-                     (or (> (length prefix) 0)
-                         (> (length completions) 0)))
-            (list start end completions
-                  :annotation-function (lambda (candidate)
-                                         (get-text-property 0 'annotation candidate))
-                  :company-kind (lambda (_) 'snippet)
-                  :company-doc-buffer #'yankpad--doc-buffer
-                  :exit-function (lambda (candidate status)
-                                   (when (string= status "finished")
-                                     (let* ((current-point (point))
-                                            (region-start (- current-point (length candidate))))
-                                       (delete-region region-start current-point)
-                                       (if (member candidate categories)
-                                           (progn
-                                             (insert candidate)
-                                             (yankpad-set-category)
-                                             (message "Category changed to %s" candidate))
-                                         (let* ((full-snippet-name
-                                                 (cl-find-if (lambda (snippet)
-                                                              (string-prefix-p candidate (car snippet)))
-                                                            snippets))
-                                                (yankpad-snippet (assoc (car full-snippet-name) snippets)))
-                                           (when yankpad-snippet
-                                             (yankpad--run-snippet yankpad-snippet)))))))
-                  :exclusive 'yes)))
+               (completions (yankpad--get-completion-candidates prefix snippets)))
+          (when completions
+            ;; Use markers so exit-function knows the exact inserted region
+            ;; even if point has moved (e.g. due to yasnippet hooks).
+            (let ((start-marker (copy-marker start))
+                  (end-marker   (copy-marker end t)))
+              (list start end completions
+                    :annotation-function
+                    (lambda (c) (get-text-property 0 'annotation c))
+                    :company-kind (lambda (_) 'snippet)
+                    :company-doc-buffer #'yankpad--doc-buffer
+                    :exit-function
+                    (lambda (candidate status)
+                      (when (string= status "finished")
+                        ;; Remove the text the framework inserted, then run
+                        ;; the snippet so yasnippet / func snippets work.
+                        (delete-region start-marker end-marker)
+                        (when-let ((snippet
+                                    (cl-find-if
+                                     (lambda (s)
+                                       (let ((kw (car (split-string
+                                                       (car s)
+                                                       yankpad-expand-separator t))))
+                                         (equal kw candidate)))
+                                     snippets)))
+                          (yankpad--run-snippet snippet))))
+                    ;; Use 'no so other capf backends remain available.
+                    :exclusive 'no))))
       (error
-       (message "Yankpad completion error: %s" (error-message-string err))
+       (message "Yankpad capf error: %s" (error-message-string err))
        nil))))
 
 (provide 'yankpad)
